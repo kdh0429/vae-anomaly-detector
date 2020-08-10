@@ -126,3 +126,21 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Data
+data/
+
+# Model
+checkpoints/
+
+# Results
+test_collision_prediction.csv
+test_collision_recon_loss.csv
+test_collision_recon_result.csv
+test_free_prediction.csv
+test_free_recon_loss.csv
+test_free_recon_result.csv
+training_recon_loss.csv
+
+# Wandb
+wandb/
