@@ -13,6 +13,7 @@ from torch import nn
 from torch import optim
 from torch.nn import functional as F
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+import wandb
 
 
 class Encoder(nn.Module):
@@ -55,6 +56,7 @@ class Encoder(nn.Module):
         self.read_mu = nn.Linear(config_read_mu['in_features'], config.getint('latent_dim'))
         self.read_logvar = nn.Linear(config_read_logvar['in_features'], config.getint('latent_dim'))
         self.initialize_parameters()
+        
 
     def initialize_parameters(self):
         """
@@ -83,7 +85,6 @@ class Decoder(nn.Module):
     def __init__(self, input_dim, config):
         super(Decoder, self).__init__()
         config_decoder = json.loads(config.get("decoder"))
-        self._distr = config['distribution']
 
         decoder_network = []
         for layer in config_decoder:
@@ -104,11 +105,6 @@ class Decoder(nn.Module):
             elif layer['type'] == 'read_x':
                 decoder_network.append(nn.Linear(layer['in_features'], input_dim))
         self.decoder = nn.Sequential(*decoder_network)
-        if self._distr == 'poisson':
-            self.read_alpha = nn.Sequential(
-                nn.Linear(config.getint('latent_dim'), input_dim),
-                nn.ReLU6()
-            )
         self.initialize_parameters()
 
     def initialize_parameters(self):
@@ -119,11 +115,7 @@ class Decoder(nn.Module):
                 layer.bias.data.zero_()
 
     def forward(self, z):
-        if self._distr == 'poisson':
-            alpha = 0.5 * self.read_alpha(z)
-            return alpha * self.decoder(z)
-        else:
-            return self.decoder(z)
+        return self.decoder(z)
 
 
 class VAE(nn.Module):
@@ -135,7 +127,6 @@ class VAE(nn.Module):
         self.config = config
         self.model_name = '{}{}'.format(config['model']['name'], config['model']['config_id'])
         self.checkpoint_directory = checkpoint_directory
-        self._distr = config['model']['distribution']
         self._device = config['model']['device']
         self._encoder = Encoder(input_dim, config['model'])
         self._decoder = Decoder(input_dim, config['model'])
@@ -156,6 +147,7 @@ class VAE(nn.Module):
 
         self.cur_epoch = 0
         self._save_every = config.getint('model', 'save_every')
+
 
     def parameters(self):
         return chain(self._encoder.parameters(), self._decoder.parameters())
@@ -178,160 +170,178 @@ class VAE(nn.Module):
     def _to_numpy(self, tensor):
         return tensor.data.cpu().numpy()
 
-    def poisson_cross_entropy(self, logtheta, inputs):
-        return - inputs * logtheta + torch.exp(logtheta)
-
-    def loglikelihood(self, reduction):
-        """
-        Return the log-likelihood
-        """
-        if self._distr == 'poisson':
-            if reduction == 'none':
-                return self.poisson_cross_entropy
-            return nn.PoissonNLLLoss(reduction=reduction)
-        elif self._distr == 'bernoulli':
-            return nn.BCELoss(reduction=reduction)
-        else:
-            raise ValueError('{} is not a valid distribution'.format(self._distr))
-
-    def fit(self, trainloader, print_every=1):
+    def fit(self, trainloader, validationloader, print_every=1):
         """
         Train the neural network
         """
 
-        start_time = time.time()
-
-        storage = {
-            'loss': [], 'kldiv': [], '-logp(x|z)': [],
-            'precision': [], 'recall': [], 'log_densities': None, 'params': None
-        }
-
         for epoch in range(self.cur_epoch, self.cur_epoch + self.num_epochs):
-
+            print("--------------------------------------------------------")
+            print("Training Epoch ", epoch)
             self.cur_epoch += 1
 
             # temporary storage
-            losses, kldivs, neglogliks = [], [], []
-
+            train_losses, train_kldivs, train_reconlos = [], [], []
+            time_pre = time.time()
+            batch = 0
             for inputs, _ in trainloader:
                 self.train()
                 inputs = inputs.to(self._device)
-                logtheta = self.forward(inputs)
-                loglikelihood = -self.loglikelihood(reduction='sum')(logtheta, inputs) / inputs.shape[0]
+                outputs = self.forward(inputs)
+
+                recon_loss = nn.L1Loss(reduction='sum')(outputs, inputs) / inputs.shape[0]
                 kl_div = -0.5 * torch.sum(1 + self.logvar - self.mu.pow(2) - self.logvar.exp()) / inputs.shape[0]
-                loss = -loglikelihood + kl_div
+                loss = recon_loss + kl_div
                 loss.backward()
+
                 self._optim.step()
                 self._optim.zero_grad()
-                losses.append(self._to_numpy(loss))
-                kldivs.append(self._to_numpy(kl_div))
-                neglogliks.append(self._to_numpy(-loglikelihood))
 
-            storage['loss'].append(np.mean(losses))
-            storage['kldiv'].append(np.mean(kldivs))
-            storage['-logp(x|z)'].append(np.mean(neglogliks))
+                train_losses.append(self._to_numpy(loss))
+                train_kldivs.append(self._to_numpy(kl_div))
+                train_reconlos.append(self._to_numpy(recon_loss))
+                batch += 1
+            
+                if batch == 100:
+                    print("Time: ", time.time() - time_pre)
 
-            if (epoch + 1) % print_every == 0:
-                epoch_time = self._get_time(start_time, time.time())
-                f1, acc, prec, recall = self.evaluate(trainloader)
-                storage['precision'].append(prec)
-                storage['recall'].append(recall)
-                print('epoch: {} | loss: {:.3f} | -logp(x|z): {:.3f} | kldiv: {:.3f} | time: {}'.format(
-                    epoch + 1,
-                    storage['loss'][-1],
-                    storage['-logp(x|z)'][-1],
-                    storage['kldiv'][-1],
-                    epoch_time))
-                print('F1. {:.3f} | acc. {:.3f} | prec.: {:.3f} | rec. {:.3f}'.format(f1, acc, prec, recall))
 
-            if (epoch + 1) % self._save_every == 0:
-                f1, acc, prec, recall = self.evaluate(trainloader)
-                self.save_checkpoint(f1)
+            print('Training Loss: ', np.mean(train_losses))
+            print('Train kldiv', np.mean(train_kldivs))
+            print('Training Reconstruction', np.mean(train_reconlos))
 
-        storage['log_densities'] = self._get_densities(trainloader)
-        storage['params'] = self._get_parameters(trainloader)
-        with open('./results/{}.pkl'.format(self.model_name), 'wb') as _f:
-            pickle.dump(storage, _f, pickle.HIGHEST_PROTOCOL)
+            if self.config.getboolean("log", "wandb") is True:
+                wandb_dict = dict()
+                wandb_dict['Training Loss'] = np.mean(train_losses)
+                wandb_dict['Train kldiv'] = np.mean(train_kldivs)
+                wandb_dict['Training Reconstruction'] = np.mean(train_reconlos)
 
-    def _get_time(self, starting_time, current_time):
-        total_time = current_time - starting_time
-        minutes = round(total_time // 60)
-        seconds = round(total_time % 60)
-        return '{} min., {} sec.'.format(minutes, seconds)
+                if epoch % 10 == 0:
+                    f1, accuracy, precision, recall, recon_mean = self.evaluate(trainloader, validationloader)
+                    self.save_checkpoint(f1)
+                    print("Threshold: ", self.threshold)
+                    print("Validation F1 Score: ", f1)
+                    print("Validation Accuracy: ", accuracy)
+                    print("Validation Precision: ", precision)
+                    print("Validation Recall: ", recall)
+                    print("Validation Recon Loss: ", recon_mean)
+                    wandb_dict['Validation F1'] = f1
+                    wandb_dict['Validation Accuracy'] = accuracy
+                    wandb_dict['Validation Precision'] = precision
+                    wandb_dict['Validation Recall'] = recall
+                    wandb_dict['Validation Mean'] = recon_mean
 
-    # def _remove_spam(self, dataloader, data):
-    #    idx_to_remove = self._find_threshold(dataloader)
-    #    data.pop(idx_to_remove)
-    #    self._encoder.initialize_parameters()
-    #    self._decoder.initialize_parameters()
-    #    self._optim = optim.Adam(self.parameters(), lr=self.lr, betas=(0.5, 0.999))
-    #    return data
+                wandb.log(wandb_dict)
 
-    def _get_parameters(self, dataloader):
-        self.eval()
-        parameters = []
-        for inputs, _ in dataloader:
-            inputs = inputs.to(self._device)
-            logtheta = self._to_numpy(self.forward(inputs))
-            parameters.extend(logtheta)
-        if self._distr == 'poisson':
-            parameters = np.exp(np.array(parameters))
-        else:
-            parameters = np.array(parameters)
-        return parameters
+    def test(self, trainloader, testcollisionloader, testfreeloader):
+        print("--------------------------------------------------------")
+        print("Final Threshold: ", self.threshold)
+        training_recon_losses = self._get_densities(trainloader)
+
+        predictions_col = []
+        ground_truth_col = []
+        test_recon_losses_col = []
+        test_recon_col = []
+        for inputs, labels in testcollisionloader:
+            pred, test_recon_loss, output = self.predict(inputs,test_mode=True)
+            predictions_col.extend(pred)
+            ground_truth_col.extend(list(self._to_numpy(torch.flatten(labels))))
+            test_recon_losses_col.extend(test_recon_loss)
+            test_recon_col.extend(output)
+        
+        f1 = f1_score(ground_truth_col, predictions_col)
+        accuracy = accuracy_score(ground_truth_col, predictions_col)
+        precision = precision_score(ground_truth_col, predictions_col)
+        recall = recall_score(ground_truth_col, predictions_col)
+
+        print("Test F1 Score: ", f1)
+        print("Test Accuracy: ", accuracy)
+        print("Test Precision: ", precision)
+        print("Test Recall: ", recall)
+
+        predictions_free = []
+        test_recon_losses_free = []
+        test_recon_free = []
+        for inputs, labels in testfreeloader:
+            pred, test_recon_loss, output = self.predict(inputs,test_mode=True)
+            predictions_free.extend(pred)
+            test_recon_losses_free.extend(test_recon_loss)
+            test_recon_free.extend(output)
+
+        np.savetxt("training_recon_loss.csv", training_recon_losses, delimiter=",")
+        np.savetxt("test_collision_prediction.csv", predictions_col, delimiter=",")
+        np.savetxt("test_collision_recon_loss.csv", test_recon_losses_col, delimiter=",")
+        np.savetxt("test_collision_recon_result.csv", test_recon_col, delimiter=",")
+        np.savetxt("test_free_prediction.csv", predictions_free, delimiter=",")
+        np.savetxt("test_free_recon_loss.csv", test_recon_losses_free, delimiter=",")
+        np.savetxt("test_free_recon_result.csv", test_recon_free, delimiter=",")
+        
+
 
     def _get_densities(self, dataloader):
-        all_log_densities = []
+        all_recon_losses = []
         for inputs, _ in dataloader:
-            mini_batch_log_densities = self._evaluate_probability(inputs)
-            all_log_densities.extend(mini_batch_log_densities)
-        all_log_densities = np.array(all_log_densities)
-        return all_log_densities
+            mini_batch_recon_loss = self._evaluate_reconstruction_loss(inputs)
+            all_recon_losses.extend(mini_batch_recon_loss)
+        all_recon_losses = np.array(all_recon_losses)
+        return all_recon_losses
 
-    def _evaluate_probability(self, inputs):
+    def _evaluate_reconstruction_loss(self, inputs, test_mode=False):
         self.eval()
         with torch.no_grad():
             inputs = inputs.to(self._device)
-            logtheta = self.forward(inputs)
-            log_likelihood = -self.loglikelihood(reduction='none')(logtheta, inputs)
-            log_likelihood = torch.sum(log_likelihood, 1)
-            assert inputs.shape[0] == log_likelihood.shape[0]
-            return self._to_numpy(log_likelihood)
+            outputs = self.forward(inputs)
+            recon_loss = nn.L1Loss(reduction='none')(outputs, inputs)
+            recon_losses = torch.sum(recon_loss, 1)
+            assert inputs.shape[0] == recon_losses.shape[0]
+            if not test_mode:
+                return self._to_numpy(recon_losses)
+            else:
+                return self._to_numpy(recon_losses), self._to_numpy(outputs)
 
     def _find_threshold(self, dataloader):
-        log_densities = self._get_densities(dataloader)
-        lowest_density = np.argmin(log_densities)
-        self.threshold = np.percentile(log_densities, self.precentile_threshold)
+        densities = self._get_densities(dataloader)
+        lowest_density = np.argmin(densities)
+        self.threshold = np.percentile(densities, self.precentile_threshold)
         return lowest_density
 
-    def evaluate(self, dataloader):
+    def evaluate(self, trainloader, validationloader):
         """
         Evaluate accuracy.
         """
-        self._find_threshold(dataloader)
+        self._find_threshold(trainloader)
         predictions = []
         ground_truth = []
+        recon_losses = []
 
-        for inputs, targets in dataloader:
-            pred = self.predict(inputs)
+        for inputs, labels in validationloader:
+            pred, recon_loss = self.predict(inputs,test_mode=False)
             predictions.extend(pred)
-            ground_truth.extend(list(self._to_numpy(targets)))
+            recon_losses.extend(recon_loss)
+            ground_truth.extend(list(self._to_numpy(torch.flatten(labels))))
 
         f1 = f1_score(ground_truth, predictions)
         accuracy = accuracy_score(ground_truth, predictions)
         precision = precision_score(ground_truth, predictions)
         recall = recall_score(ground_truth, predictions)
+        recon_mean = np.mean(recon_losses,0)
 
-        return f1, accuracy, precision, recall
+        return f1, accuracy, precision, recall, recon_mean
 
-    def predict(self, inputs):
+    def predict(self, inputs, test_mode=False):
         """
         Predict the class of the inputs
         """
-        log_density = self._evaluate_probability(inputs)
-        predictions = np.zeros_like(log_density).astype(int)
-        predictions[log_density < self.threshold] = 1
-        return list(predictions)
+        if not test_mode:
+            recon_loss = self._evaluate_reconstruction_loss(inputs,test_mode)
+        else:
+            recon_loss, outputs = self._evaluate_reconstruction_loss(inputs,test_mode)
+        predictions = np.zeros_like(recon_loss).astype(int)
+        predictions[recon_loss > self.threshold] = 1
+        if not test_mode:
+            return list(predictions), recon_loss
+        else:
+            return list(predictions), recon_loss, outputs
 
     def save_checkpoint(self, f1_score):
         """Save model paramers under config['model_path']"""

@@ -10,16 +10,16 @@ from configparser import ConfigParser
 from datetime import datetime
 
 from vae.vae import VAE
-from utils.data import SpamDataset
-from utils.feature_extractor import FeatureExtractor
+from utils.data import CollisionDataset
 from constants import MODELS
 
+import wandb
 
 def argparser():
     """
     Command line argument parser
     """
-    parser = argparse.ArgumentParser(description='VAE spam detector')
+    parser = argparse.ArgumentParser(description='VAE collision detection')
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument(
         '--globals', type=str, default='./configs/globals.ini', 
@@ -75,7 +75,7 @@ def load_config(args):
     return config
 
 
-def train(config, trainloader, devloader=None):
+def run(config, trainloader, validatonloader, testcollisionloader, testfreeloader, devloader=None):
     current_time = datetime.now().strftime('%Y_%m_%d_%H_%M')
     checkpoint_directory = os.path.join(
         config['paths']['checkpoints_directory'],
@@ -86,34 +86,67 @@ def train(config, trainloader, devloader=None):
     input_dim = trainloader.dataset.input_dim_
     vae = VAE(input_dim, config, checkpoint_directory)
     vae.to(config['model']['device'])
-    vae.fit(trainloader)
+    vae.fit(trainloader, validatonloader)
+    vae.test(trainloader, testcollisionloader,testfreeloader)
 
 
 if __name__ == '__main__':
     args = argparser()
     config = load_config(args)
+    
+    if config.getboolean("log", "wandb") is True:
+        wandb.init(project="Anomaly Detection", tensorboard=False)
+        wandb_config_dict = dict()
+        for section in config.sections():
+            for key, value in config[section].items():
+                wandb_config_dict[key] = value
+        wandb.config.update(wandb_config_dict)
 
     # Get data path
     data_dir = config.get("paths", "data_directory")
     train_data_file_name = config.get("paths", "train_data_file_name")
     train_csv_path = os.path.join(data_dir, train_data_file_name)
-
-    # Set text processing function
-    transformer = FeatureExtractor(config)
-    raw_documents = transformer.get_raw_documents(train_csv_path)
-    transformer.fit(raw_documents)
-    transformer.log_vocabulary('data/vocab.txt')
-
-    train_data = SpamDataset(
-        train_csv_path,
-        label2int=json.loads(config.get("data", "label2int")),
-        transform=transformer.vectorize)
-
+    train_data = CollisionDataset(
+        train_csv_path)
     trainloader = DataLoader(
         train_data,
         batch_size=config.getint("training", "batch_size"),
         shuffle=True,
-        num_workers=0,
+        drop_last=True,
+        num_workers=8,
+        pin_memory=True)
+
+    validation_data_file_name = config.get("paths", "validation_data_file_name")
+    validation_csv_path = os.path.join(data_dir, validation_data_file_name)
+    validation_data = CollisionDataset(
+        validation_csv_path)
+    validationloader = DataLoader(
+        validation_data,
+        batch_size=validation_data.__len__(),
+        shuffle=False,
+        num_workers=1,
         pin_memory=False)
 
-    train(config, trainloader)
+    test_collision_data_file_name = config.get("paths", "test_collision_data_file_name")
+    test_collision_csv_path = os.path.join(data_dir, test_collision_data_file_name)
+    test_collision_data = CollisionDataset(
+        test_collision_csv_path)
+    testcollisionloader = DataLoader(
+        test_collision_data,
+        batch_size=config.getint("training", "batch_size"),
+        shuffle=False,
+        num_workers=8,
+        pin_memory=False)
+
+    test_free_data_file_name = config.get("paths", "test_free_data_file_name")
+    test_free_csv_path = os.path.join(data_dir, test_free_data_file_name)
+    test_free_data = CollisionDataset(
+        test_free_csv_path)
+    testfreeloader = DataLoader(
+        test_free_data,
+        batch_size=config.getint("training", "batch_size"),
+        shuffle=False,
+        num_workers=8,
+        pin_memory=False)
+
+    run(config, trainloader, validationloader, testcollisionloader, testfreeloader)
